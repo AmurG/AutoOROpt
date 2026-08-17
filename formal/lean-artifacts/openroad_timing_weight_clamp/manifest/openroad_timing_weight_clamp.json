@@ -1,0 +1,17 @@
+{
+  "id": "openroad_timing_weight_clamp",
+  "repo": {
+    "path": "formal/openroad",
+    "remote": "https://github.com/The-OpenROAD-Project/OpenROAD",
+    "base_commit": "b59f633125fff075872087a96deaa1f3a11b2daa"
+  },
+  "patch": "formal/lean-artifacts/openroad_timing_weight_clamp/patch/openroad_timing_weight_clamp.patch",
+  "contracts": [
+    {
+      "id": "weight_bounds_real_model",
+      "description": "Model the timing weight computation as clamping into [1, netWeightMax] and prove bounds.",
+      "statement": "formal/lean-artifacts/openroad_timing_weight_clamp/lean_contract/openroad_timing_weight.statement.lean",
+      "proof": "formal/lean-artifacts/openroad_timing_weight_clamp/lean_contract/openroad_timing_weight.proof.lean"
+    }
+  ]
+}

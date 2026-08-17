@@ -1,0 +1,12 @@
+openroad_env.sif*
+.DS_Store
+*.xlsx
+*.xls
+*.pdf
+.lake/
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk

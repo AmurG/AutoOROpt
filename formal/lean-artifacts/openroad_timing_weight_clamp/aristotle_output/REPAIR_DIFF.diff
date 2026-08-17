@@ -1,0 +1,32 @@
+--- aristotle_input/OpenRoadTimingWeight.lean	2026-04-14 15:28:57
++++ aristotle_output/OpenRoadTimingWeight.lean	2026-04-14 15:29:11
+@@ -11,23 +11,22 @@
+ def clamp (x lo hi : Real) : Real :=
+   max lo (min hi x)
+ 
+-def timingWeight (net_weight_max slack_max slack_min net_slack : Real) : Real :=
++noncomputable def timingWeight (net_weight_max slack_max slack_min net_slack : Real) : Real :=
+   let hi := netWeightMax net_weight_max
+   let raw :=
+     1 + (hi - 1) * (slack_max - net_slack) / (slack_max - slack_min)
+   clamp raw 1 hi
+ 
+ theorem netWeightMax_ge_one (max_param : Real) : 1 ≤ netWeightMax max_param := by
+-  sorry
++  exact le_max_left _ _
+ 
+ theorem clamp_bounds (x lo hi : Real) (h : lo ≤ hi) :
+     lo ≤ clamp x lo hi ∧ clamp x lo hi ≤ hi := by
+-  sorry
++  exact ⟨ le_max_left _ _, by exact max_le h ( min_le_left _ _ ) ⟩
+ 
+ theorem timingWeight_bounds (net_weight_max slack_max slack_min net_slack : Real) :
+     1 ≤ timingWeight net_weight_max slack_max slack_min net_slack ∧
+       timingWeight net_weight_max slack_max slack_min net_slack ≤ netWeightMax net_weight_max := by
+-  sorry
++  exact ⟨ by exact le_max_left _ _, by exact max_le_iff.mpr ⟨ by linarith [ netWeightMax_ge_one net_weight_max ], min_le_left _ _ ⟩ ⟩
+ 
+-end OpenROAD
+-
++end OpenROAD
+\ No newline at end of file

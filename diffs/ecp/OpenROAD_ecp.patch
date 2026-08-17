@@ -1,0 +1,695 @@
+# OpenROAD_ecp custom patch
+# upstream base: 7bc521f36a34c986885473856e9f5b464093e38a
+# variant      : ecp (custom downstream modifications)
+
+diff --git a/src/gpl/include/gpl/Replace.h b/src/gpl/include/gpl/Replace.h
+index 5d48a8ba2c..02c1438c31 100644
+--- a/src/gpl/include/gpl/Replace.h
++++ b/src/gpl/include/gpl/Replace.h
+@@ -184,6 +184,7 @@ class Replace
+   float routabilityRcK4_ = 0.0;
+ 
+   float timingNetWeightMax_ = 5;
++  bool timingNetWeightMax_user_set_ = false;
+   float keepResizeBelowOverflow_ = 1.0;
+ 
+   bool timingDrivenMode_ = true;
+diff --git a/src/gpl/src/nesterovBase.h b/src/gpl/src/nesterovBase.h
+index f815d39f7e..fc2adfaf2f 100644
+--- a/src/gpl/src/nesterovBase.h
++++ b/src/gpl/src/nesterovBase.h
+@@ -770,7 +770,7 @@ class NesterovPlaceVars
+   float initialPrevCoordiUpdateCoef = 100;  // z_ref_alpha
+   float referenceHpwl = 446000000;          // refDeltaHpwl
+   float routability_end_overflow = 0.30;
+-  float keepResizeBelowOverflow = 0.3;
++  float keepResizeBelowOverflow = 1.0;
+ 
+   static const int maxRecursionWlCoef = 10;
+   static const int maxRecursionInitSLPCoef = 10;
+diff --git a/src/gpl/src/replace.cpp b/src/gpl/src/replace.cpp
+index 8641e78935..b1d667ffc6 100644
+--- a/src/gpl/src/replace.cpp
++++ b/src/gpl/src/replace.cpp
+@@ -5,7 +5,9 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstdlib>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <utility>
+ 
+@@ -21,7 +23,6 @@
+ #include "placerBase.h"
+ #include "routeBase.h"
+ #include "rsz/Resizer.hh"
+-#include "sta/StaMain.hh"
+ #include "timingBase.h"
+ #include "utl/Logger.h"
+ 
+@@ -29,6 +30,23 @@ namespace gpl {
+ 
+ using utl::GPL;
+ 
++namespace {
++std::optional<float> getEnvFloat(const char* name)
++{
++  const char* raw = std::getenv(name);
++  if (raw == nullptr || *raw == '\0') {
++    return std::nullopt;
++  }
++
++  char* end = nullptr;
++  const float value = std::strtof(raw, &end);
++  if (end == raw || (end != nullptr && *end != '\0')) {
++    return std::nullopt;
++  }
++  return value;
++}
++}  // namespace
++
+ Replace::Replace(odb::dbDatabase* odb,
+                  sta::dbSta* sta,
+                  rsz::Resizer* resizer,
+@@ -100,6 +118,7 @@ void Replace::reset()
+   timingNetWeightOverflows_.clear();
+   timingNetWeightOverflows_.shrink_to_fit();
+   timingNetWeightMax_ = 5;
++  timingNetWeightMax_user_set_ = false;
+ }
+ 
+ void Replace::addPlacementCluster(const Cluster& cluster)
+@@ -325,6 +344,16 @@ bool Replace::initNesterovPlace(int threads)
+   if (!tb_) {
+     tb_ = std::make_shared<TimingBase>(nbc_, rs_, log_);
+     tb_->setTimingNetWeightOverflows(timingNetWeightOverflows_);
++    if (!timingNetWeightMax_user_set_) {
++      if (auto env_max = getEnvFloat("GPL_WEIGHT_MAX")) {
++        if (*env_max > 0.0f) {
++          timingNetWeightMax_ = *env_max;
++        } else {
++          log_->warn(
++              GPL, 159, "Ignoring GPL_WEIGHT_MAX={} (must be > 0).", *env_max);
++        }
++      }
++    }
+     tb_->setTimingNetWeightMax(timingNetWeightMax_);
+   }
+ 
+@@ -614,6 +643,7 @@ void Replace::addTimingNetWeightOverflow(int overflow)
+ void Replace::setTimingNetWeightMax(float max)
+ {
+   timingNetWeightMax_ = max;
++  timingNetWeightMax_user_set_ = true;
+ }
+ 
+ }  // namespace gpl
+diff --git a/src/gpl/src/timingBase.cpp b/src/gpl/src/timingBase.cpp
+index e8bb6cdccd..9bbbdea5ca 100644
+--- a/src/gpl/src/timingBase.cpp
++++ b/src/gpl/src/timingBase.cpp
+@@ -6,8 +6,10 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstddef>
++#include <cstdlib>
+ #include <functional>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -15,6 +17,7 @@
+ #include "placerBase.h"
+ #include "rsz/Resizer.hh"
+ #include "sta/Fuzzy.hh"
++#include "sta/NetworkClass.hh"
+ #include "utl/Logger.h"
+ 
+ namespace gpl {
+@@ -22,7 +25,10 @@ namespace gpl {
+ using utl::GPL;
+ 
+ // TimingBase
+-TimingBase::TimingBase() = default;
++TimingBase::TimingBase()
++{
++  loadEnvOverrides();
++}
+ 
+ TimingBase::TimingBase(std::shared_ptr<NesterovBaseCommon> nbc,
+                        rsz::Resizer* rs,
+@@ -32,6 +38,7 @@ TimingBase::TimingBase(std::shared_ptr<NesterovBaseCommon> nbc,
+   rs_ = rs;
+   nbc_ = std::move(nbc);
+   log_ = log;
++  loadEnvOverrides();
+ }
+ 
+ void TimingBase::initTimingOverflowChk()
+@@ -40,6 +47,72 @@ void TimingBase::initTimingOverflowChk()
+   timingOverflowChk_.resize(timingNetWeightOverflow_.size(), false);
+ }
+ 
++namespace {
++std::optional<float> getEnvFloat(const char* name, utl::Logger* log)
++{
++  const char* raw = std::getenv(name);
++  if (raw == nullptr || *raw == '\0') {
++    return std::nullopt;
++  }
++
++  char* end = nullptr;
++  const float value = std::strtof(raw, &end);
++  if (end == raw || (end != nullptr && *end != '\0')) {
++    if (log != nullptr) {
++      log->warn(GPL, 124, "Ignoring {}='{}' (not a valid float).", name, raw);
++    }
++    return std::nullopt;
++  }
++  return value;
++}
++}  // namespace
++
++void TimingBase::loadEnvOverrides()
++{
++  if (auto env_max = getEnvFloat("GPL_WEIGHT_MAX", log_)) {
++    if (*env_max > 0.0F) {
++      net_weight_max_ = *env_max;
++    } else if (log_ != nullptr) {
++      log_->warn(
++          GPL, 125, "Ignoring GPL_WEIGHT_MAX={} (must be > 0).", *env_max);
++    }
++  }
++
++  if (auto env_exp = getEnvFloat("GPL_WEIGHT_EXP", log_)) {
++    if (*env_exp > 0.0F) {
++      net_weight_exponent_ = *env_exp;
++    } else if (log_ != nullptr) {
++      log_->warn(
++          GPL, 126, "Ignoring GPL_WEIGHT_EXP={} (must be > 0).", *env_exp);
++    }
++  }
++
++  const char* raw_use_zero_ref = std::getenv("GPL_WEIGHT_USE_ZERO_REF");
++  if (raw_use_zero_ref != nullptr && *raw_use_zero_ref != '\0') {
++    // Treat any non-zero value as enabled. Keep silent on parse issues to avoid
++    // plumbing yet another message id just for an experimental knob.
++    use_zero_slack_ref_ = (std::atoi(raw_use_zero_ref) != 0);
++  }
++
++  if (auto env_cov = getEnvFloat("GPL_WEIGHT_COVERAGE", log_)) {
++    // Interpret as percent of the "worst nets" set to use as the cutoff.
++    // Zero disables; values outside (0,100] are ignored.
++    if (*env_cov > 0.0F && *env_cov <= 100.0F) {
++      net_weight_coverage_percent_ = *env_cov;
++    }
++  }
++
++  const char* raw_len_factor = std::getenv("GPL_WEIGHT_USE_LENGTH_FACTOR");
++  if (raw_len_factor != nullptr && *raw_len_factor != '\0') {
++    use_length_factor_ = (std::atoi(raw_len_factor) != 0);
++  }
++
++  if (auto env_len_alpha = getEnvFloat("GPL_WEIGHT_LENGTH_ALPHA", log_)) {
++    // Clamp to [0,1] and stay silent on range violations (experimental knob).
++    length_alpha_ = std::clamp(*env_len_alpha, 0.0F, 1.0F);
++  }
++}
++
+ bool TimingBase::isTimingNetWeightOverflow(float overflow)
+ {
+   int intOverflow = std::round(overflow * 100);
+@@ -136,10 +209,18 @@ bool TimingBase::executeTimingDriven(bool run_journal_restore)
+   }
+ 
+   // min/max slack for worst nets
+-  auto slack_min = rs_->resizeNetSlack(worst_slack_nets[0]).value();
+-  auto slack_max
+-      = rs_->resizeNetSlack(worst_slack_nets[worst_slack_nets.size() - 1])
+-            .value();
++  const auto slack_min_opt = rs_->resizeNetSlack(worst_slack_nets[0]);
++  const auto slack_max_opt
++      = rs_->resizeNetSlack(worst_slack_nets[worst_slack_nets.size() - 1]);
++  if (!slack_min_opt || !slack_max_opt) {
++    log_->warn(
++        GPL,
++        111,
++        "Timing-driven: missing net slack. Timing-driven mode disabled.");
++    return false;
++  }
++  auto slack_min = *slack_min_opt;
++  auto slack_max = *slack_max_opt;
+ 
+   log_->info(GPL, 106, "Timing-driven: worst slack {:.3g}", slack_min);
+ 
+@@ -151,6 +232,54 @@ bool TimingBase::executeTimingDriven(bool run_journal_restore)
+   }
+ 
+   int weighted_net_count = 0;
++  using SlackT = decltype(slack_max);
++  const SlackT slack_zero = 0.0;
++  SlackT slack_ref = slack_max;
++  if (use_zero_slack_ref_) {
++    slack_ref = slack_zero;
++    if (net_weight_coverage_percent_ > 0.0F && !worst_slack_nets.empty()) {
++      const size_t worst_count = worst_slack_nets.size();
++      size_t coverage_count = static_cast<size_t>(
++          std::ceil(worst_count * net_weight_coverage_percent_ / 100.0F));
++      coverage_count = std::clamp<size_t>(coverage_count, 1, worst_count);
++      if (worst_count >= 2) {
++        coverage_count = std::max<size_t>(coverage_count, 2);
++      }
++      auto cutoff_opt
++          = rs_->resizeNetSlack(worst_slack_nets[coverage_count - 1]);
++      if (cutoff_opt) {
++        slack_ref = std::min(cutoff_opt.value(), slack_zero);
++      }
++    }
++  }
++
++  double length_norm = 0.0;
++  size_t length_norm_count = 0;
++  const float length_alpha = std::clamp(length_alpha_, 0.0F, 1.0F);
++  if (use_length_factor_) {
++    for (auto& gNet : nbc_->getGNets()) {
++      if (gNet->getGPins().size() <= 1) {
++        continue;
++      }
++      auto net_slack_opt = rs_->resizeNetSlack(gNet->getPbNet()->getDbNet());
++      if (!net_slack_opt) {
++        continue;
++      }
++      const SlackT net_slack = net_slack_opt.value();
++      if (!(net_slack < slack_ref)) {
++        continue;
++      }
++      const double dx = static_cast<double>(gNet->ux() - gNet->lx());
++      const double dy = static_cast<double>(gNet->uy() - gNet->ly());
++      length_norm += std::hypot(dx, dy);
++      length_norm_count++;
++    }
++    if (length_norm_count > 0) {
++      length_norm /= static_cast<double>(length_norm_count);
++    } else {
++      length_norm = 0.0;
++    }
++  }
+   for (auto& gNet : nbc_->getGNets()) {
+     // default weight
+     gNet->setTimingWeight(1.0);
+@@ -160,15 +289,29 @@ bool TimingBase::executeTimingDriven(bool run_journal_restore)
+         continue;
+       }
+       auto net_slack = net_slack_opt.value();
+-      if (net_slack < slack_max) {
+-        if (slack_max == slack_min) {
++      if (net_slack < slack_ref) {
++        if (slack_ref == slack_min) {
+           gNet->setTimingWeight(1.0);
+         } else {
+           // weight(min_slack) = net_weight_max_
+           // weight(max_slack) = 1
+-          const float weight = 1
+-                               + (net_weight_max_ - 1) * (slack_max - net_slack)
+-                                     / (slack_max - slack_min);
++          const float normalized_slack
++              = std::clamp(static_cast<float>((slack_ref - net_slack)
++                                              / (slack_ref - slack_min)),
++                           0.0F,
++                           1.0F);
++          float scaled_slack = std::pow(normalized_slack, net_weight_exponent_);
++          if (use_length_factor_ && length_norm > 0.0) {
++            const double dx = static_cast<double>(gNet->ux() - gNet->lx());
++            const double dy = static_cast<double>(gNet->uy() - gNet->ly());
++            const double len_metric = std::hypot(dx, dy);
++            const float len_ratio = std::clamp(
++                static_cast<float>(len_metric / length_norm), 0.0F, 1.0F);
++            const float length_factor
++                = (1.0F - length_alpha) + length_alpha * len_ratio;
++            scaled_slack *= length_factor;
++          }
++          const float weight = 1 + (net_weight_max_ - 1) * scaled_slack;
+           gNet->setTimingWeight(weight);
+         }
+         weighted_net_count++;
+diff --git a/src/gpl/src/timingBase.h b/src/gpl/src/timingBase.h
+index 8bfc535f2b..c1decdf478 100644
+--- a/src/gpl/src/timingBase.h
++++ b/src/gpl/src/timingBase.h
+@@ -46,6 +46,8 @@ class TimingBase
+   bool executeTimingDriven(bool run_journal_restore);
+ 
+  private:
++  void loadEnvOverrides();
++
+   rsz::Resizer* rs_ = nullptr;
+   utl::Logger* log_ = nullptr;
+   std::shared_ptr<NesterovBaseCommon> nbc_;
+@@ -53,6 +55,17 @@ class TimingBase
+   std::vector<int> timingNetWeightOverflow_;
+   std::vector<int> timingOverflowChk_;
+   float net_weight_max_ = 5;
++  float net_weight_exponent_ = 1.0;
++  // When enabled, normalize net criticality against 0 slack (violations)
++  // instead of the best slack in the "worst nets" subset. This makes the
++  // weighting less sensitive to slack distribution changes across STA
++  // versions/corners, and avoids adding weight to positive-slack nets.
++  bool use_zero_slack_ref_ = true;
++  // Optional experimental knobs (off by default) to make the timing-driven
++  // weighting less noisy under different STA semantics.
++  float net_weight_coverage_percent_ = 0.0F;
++  bool use_length_factor_ = false;
++  float length_alpha_ = 0.5F;
+   void initTimingOverflowChk();
+ };
+ 
+diff --git a/src/rsz/include/rsz/Resizer.hh b/src/rsz/include/rsz/Resizer.hh
+index 14c0797eae..676b18b7cc 100644
+--- a/src/rsz/include/rsz/Resizer.hh
++++ b/src/rsz/include/rsz/Resizer.hh
+@@ -426,6 +426,14 @@ class Resizer : public dbStaState, public dbNetworkObserver
+   void journalRestoreTest();
+   Logger* logger() const { return logger_; }
+   void eliminateDeadLogic(bool clean_nets);
++  void setEliminateDeadLogicEnabled(bool enabled)
++  {
++    eliminate_dead_logic_enabled_ = enabled;
++  }
++  bool eliminateDeadLogicEnabled() const
++  {
++    return eliminate_dead_logic_enabled_;
++  }
+   std::optional<float> cellLeakage(LibertyCell* cell);
+   // For debugging - calls getSwappableCells
+   void reportEquivalentCells(LibertyCell* base_cell,
+@@ -767,6 +775,7 @@ class Resizer : public dbStaState, public dbNetworkObserver
+   bool exclude_clock_buffers_ = true;
+   bool buffer_moved_into_core_ = false;
+   bool match_cell_footprint_ = false;
++  bool eliminate_dead_logic_enabled_ = true;
+   // Slack map variables.
+   // This is the minimum length of wire that is worth while to split and
+   // insert a buffer in the middle of. Theoretically computed using the smallest
+diff --git a/src/rsz/src/RepairSetup.cc b/src/rsz/src/RepairSetup.cc
+index 0e4eae915c..020bac3748 100644
+--- a/src/rsz/src/RepairSetup.cc
++++ b/src/rsz/src/RepairSetup.cc
+@@ -6,7 +6,10 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstddef>
++#include <cstdint>
++#include <cstdlib>
+ #include <limits>
++#include <mutex>
+ #include <queue>
+ #include <string>
+ #include <unordered_map>
+@@ -20,6 +23,7 @@
+ #include "Rebuffer.hh"
+ #include "SizeDownMove.hh"
+ #include "db_sta/dbSta.hh"
++#include "est/EstimateParasitics.h"
+ #include "sta/Delay.hh"
+ #include "sta/NetworkClass.hh"
+ #include "sta/SearchClass.hh"
+@@ -34,7 +38,6 @@
+ #include "sta/DcalcAnalysisPt.hh"
+ #include "sta/Fuzzy.hh"
+ #include "sta/Graph.hh"
+-#include "sta/GraphDelayCalc.hh"
+ #include "sta/InputDrive.hh"
+ #include "sta/Liberty.hh"
+ #include "sta/Parasitics.hh"
+@@ -58,12 +61,13 @@ using std::string;
+ using std::vector;
+ using utl::RSZ;
+ 
++int RepairSetup::decreasing_slack_max_passes_ = 50;
++
+ using sta::Edge;
+ using sta::fuzzyEqual;
+ using sta::fuzzyGreater;
+ using sta::fuzzyGreaterEqual;
+ using sta::fuzzyLess;
+-using sta::GraphDelayCalc;
+ using sta::InstancePinIterator;
+ using sta::NetConnectedPinIterator;
+ using sta::PathEndSeq;
+@@ -74,6 +78,33 @@ using sta::VertexOutEdgeIterator;
+ 
+ RepairSetup::RepairSetup(Resizer* resizer) : resizer_(resizer)
+ {
++  static std::once_flag env_once;
++  std::call_once(env_once, [&]() {
++    const char* raw = std::getenv("RSZ_DECR_MAX_PASSES");
++    if (raw == nullptr || *raw == '\0') {
++      return;
++    }
++
++    char* end = nullptr;
++    const int64_t parsed = std::strtoll(raw, &end, 10);
++    Logger* logger = resizer_ != nullptr ? resizer_->logger() : nullptr;
++    if (end == raw || (end != nullptr && *end != '\0')) {
++      if (logger != nullptr) {
++        logger->warn(RSZ,
++                     285,
++                     "Ignoring RSZ_DECR_MAX_PASSES='{}' (not a valid integer).",
++                     raw);
++      }
++      return;
++    }
++
++    if (parsed > 0 && parsed <= std::numeric_limits<int>::max()) {
++      decreasing_slack_max_passes_ = static_cast<int>(parsed);
++    } else if (logger != nullptr) {
++      logger->warn(
++          RSZ, 286, "Ignoring RSZ_DECR_MAX_PASSES='{}' (must be > 0).", raw);
++    }
++  });
+ }
+ 
+ void RepairSetup::init()
+@@ -305,6 +336,7 @@ bool RepairSetup::repairSetup(const float setup_slack_margin,
+     int pass = 1;
+     int decreasing_slack_passes = 0;
+     resizer_->journalBegin();
++    float prev_checkpoint_tns = sta_->totalNegativeSlack(max_);
+     while (pass <= max_passes) {
+       opto_iteration++;
+       if (verbose || opto_iteration == 1) {
+@@ -392,8 +424,12 @@ bool RepairSetup::repairSetup(const float setup_slack_margin,
+       sta_->findRequireds();
+       end_slack = sta_->vertexSlack(end, max_);
+       sta_->worstSlack(max_, worst_slack, worst_vertex);
++      const float curr_tns = sta_->totalNegativeSlack(max_);
++      const bool wns_not_worse
++          = fuzzyGreaterEqual(worst_slack, prev_worst_slack);
+       const bool better
+           = (fuzzyGreater(worst_slack, prev_worst_slack)
++             || (wns_not_worse && curr_tns > prev_checkpoint_tns)
+              || (end_index != 1 && fuzzyEqual(worst_slack, prev_worst_slack)
+                  && fuzzyGreater(end_slack, prev_end_slack)));
+       debugPrint(logger_,
+@@ -409,6 +445,7 @@ bool RepairSetup::repairSetup(const float setup_slack_margin,
+         if (end_slack > setup_slack_margin) {
+           --num_viols;
+         }
++        prev_checkpoint_tns = curr_tns;
+         prev_end_slack = end_slack;
+         prev_worst_slack = worst_slack;
+         decreasing_slack_passes = 0;
+diff --git a/src/rsz/src/RepairSetup.hh b/src/rsz/src/RepairSetup.hh
+index 2087982859..0f425ba71c 100644
+--- a/src/rsz/src/RepairSetup.hh
++++ b/src/rsz/src/RepairSetup.hh
+@@ -162,7 +162,7 @@ class RepairSetup : public sta::dbStaState
+ 
+   sta::UnorderedMap<LibertyPort*, sta::LibertyPortSet> equiv_pin_map_;
+ 
+-  static constexpr int decreasing_slack_max_passes_ = 50;
++  static int decreasing_slack_max_passes_;
+   static constexpr int print_interval_ = 10;
+   static constexpr int opto_small_interval_ = 100;
+   static constexpr int opto_large_interval_ = 1000;
+diff --git a/src/rsz/src/Resizer.cc b/src/rsz/src/Resizer.cc
+index 773b9fa5b4..d316943f0e 100644
+--- a/src/rsz/src/Resizer.cc
++++ b/src/rsz/src/Resizer.cc
+@@ -43,6 +43,7 @@
+ #include "boost/multi_array.hpp"
+ #include "db_sta/dbNetwork.hh"
+ #include "db_sta/dbSta.hh"
++#include "est/EstimateParasitics.h"
+ #include "odb/db.h"
+ #include "odb/dbSet.h"
+ #include "odb/dbTypes.h"
+@@ -67,7 +68,7 @@
+ #include "sta/Sdc.hh"
+ #include "sta/Search.hh"
+ #include "sta/SearchPred.hh"
+-#include "sta/StaMain.hh"
++#include "sta/StringUtil.hh"
+ #include "sta/TimingArc.hh"
+ #include "sta/TimingModel.hh"
+ #include "sta/TimingRole.hh"
+@@ -2033,8 +2034,11 @@ LibertyCellSeq Resizer::getSwappableCells(LibertyCell* source_cell)
+     return {};
+   }
+ 
+-  LibertyCellSeq swappable_cells;
++  LibertyCellSeq filtered_cells;
++  LibertyCellSeq candidate_cells;
+   LibertyCellSeq* equiv_cells = sta_->equivCells(source_cell);
++  const bool user_function_filter = source_cell->userFunctionClass();
++  const bool filters_requested = match_cell_footprint_ || user_function_filter;
+ 
+   if (equiv_cells) {
+     int64_t source_cell_area = master->getArea();
+@@ -2081,30 +2085,56 @@ LibertyCellSeq Resizer::getSwappableCells(LibertyCell* source_cell)
+         }
+       }
+ 
++      candidate_cells.push_back(equiv_cell);
++
++      bool passes_optional_filters = true;
+       if (match_cell_footprint_) {
+         const bool footprints_match = sta::stringEqIf(source_cell->footprint(),
+                                                       equiv_cell->footprint());
+         if (!footprints_match) {
+-          continue;
++          passes_optional_filters = false;
+         }
+       }
+ 
+-      if (source_cell->userFunctionClass()) {
++      if (user_function_filter) {
+         const bool user_function_classes_match = sta::stringEqIf(
+             source_cell->userFunctionClass(), equiv_cell->userFunctionClass());
+         if (!user_function_classes_match) {
+-          continue;
++          passes_optional_filters = false;
+         }
+       }
+ 
+-      swappable_cells.push_back(equiv_cell);
++      if (passes_optional_filters) {
++        filtered_cells.push_back(equiv_cell);
++      }
+     }
+   } else {
+-    swappable_cells.push_back(source_cell);
++    candidate_cells.push_back(source_cell);
++    filtered_cells.push_back(source_cell);
++  }
++
++  bool fell_back_to_equiv = false;
++  LibertyCellSeq result;
++  if (!filtered_cells.empty()) {
++    result = std::move(filtered_cells);
++  } else if (filters_requested && !candidate_cells.empty()) {
++    fell_back_to_equiv = true;
++    result = std::move(candidate_cells);
++  } else {
++    result = std::move(candidate_cells);
++  }
++
++  if (fell_back_to_equiv) {
++    logger_->warn(
++        RSZ,
++        170,
++        "No swappable cells for {} with requested filters; falling back to "
++        "unfiltered equivalents.",
++        source_cell->name());
+   }
+ 
+-  swappable_cells_cache_[source_cell] = swappable_cells;
+-  return swappable_cells;
++  swappable_cells_cache_[source_cell] = std::move(result);
++  return swappable_cells_cache_[source_cell];
+ }
+ 
+ size_t getCommonLength(const std::string& string1, const std::string& string2)
+@@ -4980,6 +5010,10 @@ void Resizer::resetInputSlews()
+ 
+ void Resizer::eliminateDeadLogic(bool clean_nets)
+ {
++  if (!eliminate_dead_logic_enabled_) {
++    return;
++  }
++
+   std::vector<const Instance*> queue;
+   std::set<const Instance*> kept_instances;
+ 
+diff --git a/src/rsz/src/Resizer.i b/src/rsz/src/Resizer.i
+index 1d539b0d99..a96a34174d 100644
+--- a/src/rsz/src/Resizer.i
++++ b/src/rsz/src/Resizer.i
+@@ -601,6 +601,14 @@ eliminate_dead_logic_cmd(bool clean_nets)
+   resizer->eliminateDeadLogic(clean_nets);
+ }
+ 
++void
++set_eliminate_dead_logic_enabled_cmd(bool enabled)
++{
++  ensureLinked();
++  Resizer* resizer = getResizer();
++  resizer->setEliminateDeadLogicEnabled(enabled);
++}
++
+ void report_equiv_cells_cmd(LibertyCell* cell, bool match_cell_footprint,
+                             bool report_all_cells, bool report_vt_equiv)
+ {
+diff --git a/src/rsz/src/Resizer.tcl b/src/rsz/src/Resizer.tcl
+index b2347356f6..6e1903a7f7 100644
+--- a/src/rsz/src/Resizer.tcl
++++ b/src/rsz/src/Resizer.tcl
+@@ -343,8 +343,14 @@ proc repair_timing { args } {
+   }
+ 
+   set match_cell_footprint [info exists flags(-match_cell_footprint)]
++  set use_detailed_parasitics 1
++  if {[info exists ::env(NG45_USE_DETAILED_PARA)]} {
++    set use_detailed_parasitics [expr {$::env(NG45_USE_DETAILED_PARA) ? 1 : 0}]
++  }
+   if { [design_is_routed] } {
+-    est::set_parasitics_src "detailed_routing"
++    set para_src [expr {$use_detailed_parasitics ? "detailed_routing"
++                                             : "global_routing"}]
++    est::set_parasitics_src $para_src
+   }
+ 
+   set max_repairs_per_pass 1
+@@ -468,6 +474,29 @@ proc eliminate_dead_logic { } {
+ }
+ 
+ namespace eval rsz {
++
++proc set_eliminate_dead_logic_enabled { enabled } {
++  if { ![string is boolean -strict $enabled] } {
++    utl::error "RSZ" 209 \
++      "set_eliminate_dead_logic_enabled argument should be Boolean"
++  }
++
++  set normalized [string tolower $enabled]
++  switch -- $normalized {
++    1 - true - yes - on {
++      set value 1
++    }
++    0 - false - no - off {
++      set value 0
++    }
++    default {
++      set value 0
++    }
++  }
++
++  set_eliminate_dead_logic_enabled_cmd $value
++}
++
+ proc get_block { } {
+   set db [ord::get_db]
+   if { $db eq "NULL" } {
